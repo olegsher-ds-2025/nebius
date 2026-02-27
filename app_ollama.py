@@ -1,9 +1,17 @@
 """
-GitHub Repository Summarizer — Flask API
+GitHub Repository Summarizer — Flask API (Ollama / Local LLM edition)
 POST /summarize  →  { summary, technologies, structure }
 
-LLM: Nebius Token Factory (OpenAI-compatible API)
-     Configure via NEBIUS_API_KEY environment variable.
+LLM: Ollama running locally at http://localhost:11434
+     No API key needed. Configure model via OLLAMA_MODEL env var.
+     Default model: phi3:mini  (best for technical/code content on CPU)
+
+Start Ollama first:
+    ollama serve
+    ollama pull phi3:mini
+
+Then run this server:
+    python app_ollama.py
 """
 
 import os
@@ -29,13 +37,19 @@ app = Flask(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 GITHUB_API  = "https://api.github.com"
-NEBIUS_URL   = "https://api.tokenfactory.nebius.com/v1/chat/completions"
-NEBIUS_MODEL = "meta-llama/Llama-3.3-70B-Instruct"  # current model on Nebius Token Factory
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
 
-# How many bytes of a source file to include in the prompt
-FILE_CONTENT_LIMIT = 3_000   # per file
-# Rough token budget for all file contents combined (1 token ≈ 4 chars)
-CONTEXT_CHAR_BUDGET = 28_000  # leaves room for prompt overhead in a 32k context
+# phi3:mini is recommended for Intel Xe / CPU-only machines:
+#   - strong at code and technical content
+#   - fast on CPU (~12 tok/s)
+#   - only 2.2 GB download
+# Alternatives: llama3.2, gemma2:2b, mistral
+
+# Context limits — tuned for small models (phi3:mini has a 4k context window)
+# For larger models like llama3.2 or mistral you can raise these.
+FILE_CONTENT_LIMIT  = 1_500   # chars per file (keep prompt tight for small models)
+CONTEXT_CHAR_BUDGET = 8_000   # total chars for file content
 
 # Extensions we consider worth reading
 SOURCE_EXTENSIONS = {
@@ -44,33 +58,28 @@ SOURCE_EXTENSIONS = {
     ".scala", ".r", ".sql", ".sh", ".bash", ".yaml", ".yml",
     ".toml", ".cfg", ".ini", ".env.example",
     ".md", ".rst", ".txt",
-    ".json",   # only small ones (filtered by size below)
+    ".json",
     ".html", ".css",
     "Dockerfile", "Makefile",
 }
 
-# Paths/patterns to always skip
+# Paths / patterns to always skip
 SKIP_PATTERNS = {
-    # dependency dirs
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/",
     ".git/", ".github/", "dist/", "build/", ".next/", ".nuxt/",
     "target/", "vendor/", "site-packages/",
-    # generated / lock files
     "package-lock.json", "yarn.lock", "poetry.lock", "Pipfile.lock",
     "composer.lock", "Gemfile.lock", "cargo.lock",
-    # binary / media
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
     ".pdf", ".zip", ".tar", ".gz", ".whl", ".egg",
     ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin",
-    # IDE / OS
     ".DS_Store", ".idea/", ".vscode/",
-    # large data
     ".csv", ".parquet", ".feather", ".h5", ".hdf5", ".pkl", ".npy",
-    ".ipynb",   # notebooks are huge; we skip them (README describes them)
-    ".min.js", ".min.css",  # minified
+    ".ipynb",
+    ".min.js", ".min.css",
 }
 
-# Files to prioritise first (evaluated in order)
+# Files to fetch first (highest signal, lowest token cost)
 PRIORITY_FILENAMES = [
     "readme", "readme.md", "readme.rst", "readme.txt",
     "main.py", "app.py", "server.py", "index.py", "run.py",
@@ -111,7 +120,6 @@ def fetch_repo_context(owner: str, repo: str) -> dict:
     Fetch everything useful about a repo and return a structured context dict.
     Raises ValueError for 404/private, RuntimeError for other API failures.
     """
-    # 1. Metadata
     meta_r = gh_get(f"/repos/{owner}/{repo}")
     if meta_r.status_code == 404:
         raise ValueError(f"Repository '{owner}/{repo}' not found or is private.")
@@ -121,15 +129,13 @@ def fetch_repo_context(owner: str, repo: str) -> dict:
         raise RuntimeError(f"GitHub API error {meta_r.status_code}: {meta_r.text[:200]}")
     meta = meta_r.json()
 
-    # 2. README (raw text)
     readme_r = requests.get(
         f"{GITHUB_API}/repos/{owner}/{repo}/readme",
         headers={**gh_headers(), "Accept": "application/vnd.github.raw"},
         timeout=15,
     )
-    readme = readme_r.text[:5_000] if readme_r.status_code == 200 else ""
+    readme = readme_r.text[:3_000] if readme_r.status_code == 200 else ""
 
-    # 3. Full file tree
     tree_r = gh_get(f"/repos/{owner}/{repo}/git/trees/HEAD?recursive=1")
     all_files: list[dict] = []
     if tree_r.status_code == 200:
@@ -138,111 +144,79 @@ def fetch_repo_context(owner: str, repo: str) -> dict:
             if item["type"] == "blob"
         ]
 
-    # 4. Language breakdown
     lang_r    = gh_get(f"/repos/{owner}/{repo}/languages")
     languages = lang_r.json() if lang_r.status_code == 200 else {}
 
-    # 5. Select & fetch source files
     selected_files = select_files(all_files)
     file_contents  = fetch_file_contents(owner, repo, selected_files)
 
     return {
-        "meta":          meta,
-        "readme":        readme,
+        "meta":           meta,
+        "readme":         readme,
         "all_file_paths": [f["path"] for f in all_files],
-        "languages":     languages,
-        "file_contents": file_contents,
+        "languages":      languages,
+        "file_contents":  file_contents,
     }
 
 
-# ── File selection strategy ────────────────────────────────────────────────────
+# ── File selection ─────────────────────────────────────────────────────────────
 
 def should_skip(path: str, size: int) -> bool:
-    """Return True if this file should be excluded from context."""
     path_lower = path.lower()
-
-    # Skip if any skip pattern matches path prefix or suffix
     for pattern in SKIP_PATTERNS:
-        if pattern.startswith("."):          # extension
+        if pattern.startswith("."):
             if path_lower.endswith(pattern):
                 return True
-        else:                                # directory or filename pattern
+        else:
             if pattern in path_lower:
                 return True
-
-    # Skip files with no recognised extension (likely binary)
     _, ext = os.path.splitext(path_lower)
     basename = os.path.basename(path_lower)
     if ext not in SOURCE_EXTENSIONS and basename not in {
         "dockerfile", "makefile", "procfile", "gemfile", "rakefile"
     }:
         return True
-
-    # Skip very large files (> 100 KB) — probably generated or data files
     if size > 100_000:
         return True
-
     return False
 
 
 def priority_rank(path: str) -> int:
-    """Lower number = higher priority."""
     basename = os.path.basename(path).lower()
     for i, name in enumerate(PRIORITY_FILENAMES):
         if basename == name:
             return i
-    # Source files closer to root get priority
-    depth = path.count("/")
-    return len(PRIORITY_FILENAMES) + depth
+    return len(PRIORITY_FILENAMES) + path.count("/")
 
 
 def select_files(all_files: list[dict]) -> list[dict]:
-    """Filter and rank files; return the list to actually fetch."""
-    candidates = [
-        f for f in all_files
-        if not should_skip(f["path"], f.get("size", 0))
-    ]
+    candidates = [f for f in all_files if not should_skip(f["path"], f.get("size", 0))]
     candidates.sort(key=lambda f: priority_rank(f["path"]))
     return candidates
 
 
 def fetch_file_contents(owner: str, repo: str, files: list[dict]) -> list[dict]:
-    """
-    Fetch raw content for selected files, stopping when we hit CONTEXT_CHAR_BUDGET.
-    Returns list of { path, content } dicts.
-    """
-    results   = []
+    results     = []
     total_chars = 0
-
     for f in files:
         if total_chars >= CONTEXT_CHAR_BUDGET:
-            log.info("Context budget reached — stopping file fetch at %d chars", total_chars)
+            log.info("Context budget reached at %d chars", total_chars)
             break
-
         path = f["path"]
         url  = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}"
-
         try:
             r = requests.get(url, timeout=10)
             if r.status_code != 200:
                 continue
-
-            # Detect binary content quickly
             try:
                 text = r.content.decode("utf-8")
             except UnicodeDecodeError:
-                log.debug("Skipping binary file: %s", path)
                 continue
-
             snippet = text[:FILE_CONTENT_LIMIT]
             results.append({"path": path, "content": snippet})
             total_chars += len(snippet)
-            log.debug("Added %s (%d chars)", path, len(snippet))
-
         except requests.RequestException as e:
             log.warning("Could not fetch %s: %s", path, e)
-            continue
-
     log.info("Fetched %d files, %d chars total", len(results), total_chars)
     return results
 
@@ -257,119 +231,128 @@ def build_prompt(ctx: dict) -> str:
     files     = ctx["file_contents"]
 
     lang_str = ", ".join(languages.keys()) if languages else "Unknown"
-    tree_str = "\n".join(f"  {p}" for p in all_paths[:150])
-    if len(all_paths) > 150:
-        tree_str += f"\n  ... and {len(all_paths) - 150} more files"
+
+    # Trim tree to 80 entries for small-context models
+    tree_str = "\n".join(f"  {p}" for p in all_paths[:80])
+    if len(all_paths) > 80:
+        tree_str += f"\n  ... and {len(all_paths) - 80} more files"
 
     files_section = ""
     for f in files:
         files_section += f"\n### {f['path']}\n```\n{f['content']}\n```\n"
 
-    return f"""You are a senior software engineer analysing a GitHub repository.
-Your job is to produce a structured JSON analysis. Respond with ONLY valid JSON — no markdown fences, no preamble.
+    return f"""You are a senior software engineer. Analyse this GitHub repository and return ONLY a valid JSON object — no explanation, no markdown fences.
 
-## Repository Info
-- Name: {meta['full_name']}
-- Description: {meta.get('description') or 'None provided'}
-- Primary language: {meta.get('language') or 'Unknown'}
-- All languages detected: {lang_str}
-- Stars: {meta.get('stargazers_count', 0)}
-- License: {(meta.get('license') or {}).get('name', 'None')}
+Repository: {meta['full_name']}
+Description: {meta.get('description') or 'None'}
+Language: {meta.get('language') or 'Unknown'} | All: {lang_str}
+Stars: {meta.get('stargazers_count', 0)} | License: {(meta.get('license') or {}).get('name', 'None')}
 
-## File Tree (up to 150 entries)
+FILE TREE:
 {tree_str}
 
-## README
-{readme if readme else '(No README found)'}
+README:
+{readme if readme else '(none)'}
 
-## Key Source Files
-{files_section if files_section else '(No source files fetched)'}
+KEY FILES:
+{files_section if files_section else '(none)'}
 
----
-
-Return a JSON object with exactly these three fields:
-
-{{
-  "summary": "A 3–5 sentence human-readable description of what the project does, its purpose, and who it's for.",
-  "technologies": ["list", "of", "main", "technologies", "languages", "frameworks", "libraries"],
-  "structure": "1–3 sentences describing how the project is organised: key directories, entry points, test layout, config approach, etc."
-}}
-
-Be specific and accurate. Base everything on the actual files above, not general assumptions.
-"""
+Return this exact JSON structure:
+{{"summary":"3-5 sentence description of what the project does and who it is for","technologies":["tech1","tech2"],"structure":"1-2 sentences on project layout and entry points"}}"""
 
 
-# ── LLM call ───────────────────────────────────────────────────────────────────
+# ── Ollama LLM call ────────────────────────────────────────────────────────────
 
 def call_llm(prompt: str) -> dict:
     """
-    Call Nebius Token Factory API (OpenAI-compatible).
+    Call the local Ollama API (non-streaming).
     Returns parsed dict with summary, technologies, structure.
-    Raises RuntimeError on failure.
+    Raises RuntimeError on connection failure or bad response.
     """
-    api_key = os.getenv("NEBIUS_API_KEY")
-    if not api_key:
+    # Check Ollama is reachable before sending the full prompt
+    try:
+        ping = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+    except requests.exceptions.ConnectionError:
         raise RuntimeError(
-            "NEBIUS_API_KEY environment variable is not set. "
-            "Set it before starting the server."
+            f"Cannot connect to Ollama at {OLLAMA_HOST}. "
+            "Make sure it is running: ollama serve"
+        )
+
+    # Check the model is actually pulled
+    available = [m["name"] for m in ping.json().get("models", [])]
+    # Normalise: "phi3:mini" matches "phi3:mini" or just check prefix
+    model_available = any(
+        m == OLLAMA_MODEL or m.startswith(OLLAMA_MODEL.split(":")[0])
+        for m in available
+    )
+    if not model_available:
+        raise RuntimeError(
+            f"Model '{OLLAMA_MODEL}' is not pulled. "
+            f"Run: ollama pull {OLLAMA_MODEL}  "
+            f"(available: {', '.join(available) or 'none'})"
         )
 
     payload = {
-        "model": NEBIUS_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,   # low temp → consistent, factual output
-        "max_tokens": 1024,
+        "model":  OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,   # low temp → consistent JSON output
+            "num_predict": 512,   # max tokens to generate
+        },
     }
 
+    log.info("Calling Ollama model '%s' …", OLLAMA_MODEL)
     try:
         r = requests.post(
-            NEBIUS_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type":  "application/json",
-            },
+            f"{OLLAMA_HOST}/api/generate",
             json=payload,
-            timeout=60,
+            timeout=180,   # local models can be slow on CPU — give them time
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError(
+            "Ollama timed out. The model may be too slow for this machine. "
+            f"Try a smaller model: OLLAMA_MODEL=gemma2:2b python app_ollama.py"
         )
     except requests.RequestException as e:
-        raise RuntimeError(f"LLM API request failed: {e}")
+        raise RuntimeError(f"Ollama request failed: {e}")
 
-    if r.status_code == 401:
-        raise RuntimeError("Invalid NEBIUS_API_KEY — check your credentials.")
-    if r.status_code == 429:
-        raise RuntimeError("LLM API rate limit exceeded. Try again shortly.")
     if r.status_code != 200:
-        raise RuntimeError(f"LLM API error {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"Ollama returned HTTP {r.status_code}: {r.text[:200]}")
 
-    raw_text = r.json()["choices"][0]["message"]["content"].strip()
+    raw_text = r.json().get("response", "").strip()
+    log.info("Ollama response length: %d chars", len(raw_text))
 
-    # Strip markdown code fences if the model wrapped output anyway
+    # Strip markdown fences if the model added them
     raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-    raw_text = re.sub(r"\s*```$",          "", raw_text)
+    raw_text = re.sub(r"\s*```$",          "", raw_text.strip())
 
+    # Parse JSON
     try:
         result = json.loads(raw_text)
     except json.JSONDecodeError:
-        # Last-resort: try to extract JSON object from the response
+        # Try to extract a JSON object from noisy output
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if match:
-            result = json.loads(match.group())
+            try:
+                result = json.loads(match.group())
+            except json.JSONDecodeError:
+                raise RuntimeError(f"Could not parse JSON from model output: {raw_text[:300]}")
         else:
-            raise RuntimeError(f"LLM returned non-JSON output: {raw_text[:300]}")
+            raise RuntimeError(f"Model returned non-JSON output: {raw_text[:300]}")
 
-    # Validate expected fields
+    # Validate required fields
     for field in ("summary", "technologies", "structure"):
         if field not in result:
-            raise RuntimeError(f"LLM response missing field '{field}': {result}")
+            raise RuntimeError(f"Model response missing field '{field}'. Got: {result}")
 
     return result
 
 
-# ── Route ───────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/summarize")
 def summarize():
-    # ── Parse request ──────────────────────────────────────────────────────
     body = request.get_json(silent=True)
     if not body or "github_url" not in body:
         return jsonify({"status": "error", "message": "Request body must include 'github_url'."}), 400
@@ -382,7 +365,6 @@ def summarize():
     owner, repo = parsed
     log.info("Request: %s/%s", owner, repo)
 
-    # ── Fetch repo ─────────────────────────────────────────────────────────
     try:
         ctx = fetch_repo_context(owner, repo)
     except ValueError as e:
@@ -390,7 +372,6 @@ def summarize():
     except RuntimeError as e:
         return jsonify({"status": "error", "message": str(e)}), 502
 
-    # ── Build prompt & call LLM ────────────────────────────────────────────
     try:
         prompt = build_prompt(ctx)
         result = call_llm(prompt)
@@ -401,14 +382,25 @@ def summarize():
     return jsonify(result), 200
 
 
-# ── Health check ───────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "model": NEBIUS_MODEL}), 200
+    """Check both server and Ollama status."""
+    status = {"status": "ok", "model": OLLAMA_MODEL, "ollama_host": OLLAMA_HOST}
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        models = [m["name"] for m in r.json().get("models", [])]
+        status["ollama"] = "connected"
+        status["available_models"] = models
+    except Exception:
+        status["ollama"] = "unreachable"
+        status["status"] = "degraded"
+    return jsonify(status), 200
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    log.info("Starting server on http://localhost:8000")
+    log.info("Using Ollama model: %s  (override with OLLAMA_MODEL env var)", OLLAMA_MODEL)
+    log.info("Ollama host: %s  (override with OLLAMA_HOST env var)", OLLAMA_HOST)
     app.run(host="0.0.0.0", port=8000, debug=False)
